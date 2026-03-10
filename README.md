@@ -1,0 +1,2 @@
+# AutoMerge
+取得したTeraTarmmacroのログの差異確認するシェル
