@@ -35,13 +35,13 @@ YYMMDD_HHMMSS_IP_from_USER.log
 特定 IP の最新ログを基準にする場合:
 
 ```powershell
-.\Compare-ShowLogs_ByIP.ps1 -TargetIP "10.51.192.216"
+.\Compare-ShowLogs_ByIP.ps1 -TargetIP "10.0.0.1"
 ```
 
 特定ファイルを基準にする場合:
 
 ```powershell
-.\Compare-ShowLogs_ByIP.ps1 -CurrentFile "$env:USERPROFILE\Desktop\ログ保管\260212_083000_10.51.192.216_from_admin.log"
+.\Compare-ShowLogs_ByIP.ps1 -CurrentFile "$env:USERPROFILE\Desktop\ログ保管\260212_083000_10.0.0.1_from_admin.log"
 ```
 
 差分対象からノイズ行を除外する場合:
