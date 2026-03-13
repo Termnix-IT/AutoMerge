@@ -1,279 +1,555 @@
 <#
 .SYNOPSIS
-  命名規則（YYMMDD_HHMMSS_IP_from_ユーザー.log）に基づき、
-  同一IPの最新ログと 1日前／1週間前のログを比較し、差分を出力します。
+  Compare Cisco show-command logs for the same IP and export human-readable diffs.
 
 .DESCRIPTION
-  - ログフォルダ既定: デスクトップ\ログ保管
-  - 出力フォルダ既定: ログ保管\出力
-  - 「現在ログ」は同フォルダ内の最も新しい（ファイル名に含まれる日時が最大の）ファイル。
-  - 比較相手は「同一IP」かつ 指定目標時刻（現在ログの採取時刻から 1日前/1週間前）に最も近いファイルを、許容誤差の範囲で選定。
-  - 差分は行番号付きでテキスト出力します。
-  - Windows PowerShell 5.1 互換（'??' などの演算子は未使用）。
+  This script scans a log directory for files that match the naming pattern
+  YYMMDD_HHMMSS_IP_from_USER.log, selects the latest log for a target IP, and compares it
+  with the closest log captured roughly 1 day and 1 week earlier.
+
+  The diff engine uses an LCS-based comparison so inserted or deleted lines do not cause the
+  rest of the file to appear changed. Noise lines can be excluded while keeping original line
+  numbers in the report.
+
+  Compatible with Windows PowerShell 5.1 and PowerShell 7+.
 
 .PARAMETER LogDirectory
-  ログ保管フォルダ。既定: デスクトップ\ログ保管
+  Directory containing the log files. Defaults to "$HOME\Desktop\ログ保管".
 
 .PARAMETER OutputDirectory
-  出力フォルダ。既定: LogDirectory\出力
+  Directory where reports are written. Defaults to "<LogDirectory>\出力".
 
 .PARAMETER CurrentFile
-  現在ログを明示指定する場合に使用（そのファイルのIPを基準に比較）
-
-.PARAMETER OneDayToleranceHours
-  1日前検索の許容誤差（時間）。既定: 36
-
-.PARAMETER OneWeekToleranceHours
-  1週間前検索の許容誤差（時間）。既定: 96
+  Explicit current log file to use as the comparison baseline.
 
 .PARAMETER TargetIP
-  IPを明示指定して、そのIPの最新ログを基準に比較する場合に使用
+  Select the latest log for this IP as the comparison baseline.
+
+.PARAMETER OneDayToleranceHours
+  Maximum allowed distance, in hours, from the target timestamp of 1 day earlier.
+
+.PARAMETER OneWeekToleranceHours
+  Maximum allowed distance, in hours, from the target timestamp of 1 week earlier.
+
+.PARAMETER IgnorePattern
+  Regex patterns for lines to exclude before comparison. Original line numbers are preserved.
+
+.PARAMETER Recurse
+  Search for log files recursively under LogDirectory.
+
+.EXAMPLE
+  .\Compare-ShowLogs_ByIP.ps1
+
+.EXAMPLE
+  .\Compare-ShowLogs_ByIP.ps1 -TargetIP 10.51.192.216
+
+.EXAMPLE
+  .\Compare-ShowLogs_ByIP.ps1 -CurrentFile "$env:USERPROFILE\Desktop\ログ保管\260212_083000_10.51.192.216_from_admin.log"
+
+.EXAMPLE
+  .\Compare-ShowLogs_ByIP.ps1 -IgnorePattern '^\s*$', 'uptime', 'Last input'
 #>
 
+[CmdletBinding(DefaultParameterSetName = 'Auto')]
 param(
+  [Parameter()]
+  [ValidateNotNullOrEmpty()]
   [string]$LogDirectory,
+
+  [Parameter()]
   [string]$OutputDirectory,
+
+  [Parameter(ParameterSetName = 'ByFile', Mandatory = $true)]
+  [ValidateNotNullOrEmpty()]
   [string]$CurrentFile,
+
+  [Parameter(ParameterSetName = 'ByIP', Mandatory = $true)]
+  [ValidatePattern('^(?:\d{1,3}\.){3}\d{1,3}$')]
+  [string]$TargetIP,
+
+  [Parameter()]
+  [ValidateRange(1, 24 * 14)]
   [int]$OneDayToleranceHours = 36,
+
+  [Parameter()]
+  [ValidateRange(1, 24 * 30)]
   [int]$OneWeekToleranceHours = 96,
-  [string]$TargetIP
+
+  [Parameter()]
+  [string[]]$IgnorePattern = @(),
+
+  [Parameter()]
+  [switch]$Recurse
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# ====== Utility ======
+$script:LogNameRegex = '^(?<yy>\d{2})(?<mo>\d{2})(?<dd>\d{2})_(?<HH>\d{2})(?<MM>\d{2})(?<SS>\d{2})_(?<ip>\d{1,3}(?:\.\d{1,3}){3})_from_(?<user>.+?)\.log$'
 
 function Resolve-DefaultPaths {
   $desktop = [Environment]::GetFolderPath('Desktop')
-  if (-not $LogDirectory -or [string]::IsNullOrWhiteSpace($LogDirectory)) {
+
+  if ([string]::IsNullOrWhiteSpace($LogDirectory)) {
     $script:LogDirectory = Join-Path $desktop 'ログ保管'
   }
-  if (-not $OutputDirectory -or [string]::IsNullOrWhiteSpace($OutputDirectory)) {
-    $script:OutputDirectory = Join-Path $LogDirectory '出力'
+
+  if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+    $script:OutputDirectory = Join-Path $script:LogDirectory '出力'
   }
 }
 
-function Ensure-OutputDir {
-  if (-not (Test-Path -LiteralPath $OutputDirectory)) {
-    New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
+function Ensure-Directory {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+
+  if (-not (Test-Path -LiteralPath $Path)) {
+    New-Item -ItemType Directory -Path $Path | Out-Null
   }
 }
-
-## ここまで実施
-
-# 例: 260113_141553_10.51.192.216_from_i-taga3e-v.log
-#      YYMMDD_HHMMSS_IP_from_USER.log
-$NameRegex = '^(?<yy>\d{2})(?<mo>\d{2})(?<dd>\d{2})_(?<HH>\d{2})(?<MM>\d{2})(?<SS>\d{2})_(?<ip>\d{1,3}(?:\.\d{1,3}){3})_from_(?<user>.+?)\.log$'
 
 function Parse-LogName {
-  param([System.IO.FileInfo]$File)
-  $m = [regex]::Match($File.Name, $NameRegex)
-  if (-not $m.Success) { return $null }
+  param(
+    [Parameter(Mandatory = $true)]
+    [System.IO.FileInfo]$File
+  )
 
-  $year  = 2000 + [int]$m.Groups['yy'].Value
-  $month = [int]$m.Groups['mo'].Value
-  $day   = [int]$m.Groups['dd'].Value
-  $hour  = [int]$m.Groups['HH'].Value
-  $min   = [int]$m.Groups['MM'].Value
-  $sec   = [int]$m.Groups['SS'].Value
+  $match = [regex]::Match($File.Name, $script:LogNameRegex)
+  if (-not $match.Success) {
+    return $null
+  }
+
+  $year = 2000 + [int]$match.Groups['yy'].Value
+  $month = [int]$match.Groups['mo'].Value
+  $day = [int]$match.Groups['dd'].Value
+  $hour = [int]$match.Groups['HH'].Value
+  $minute = [int]$match.Groups['MM'].Value
+  $second = [int]$match.Groups['SS'].Value
 
   try {
-    $dt = [datetime]::new($year,$month,$day,$hour,$min,$sec)
+    $timestamp = [datetime]::new($year, $month, $day, $hour, $minute, $second)
   } catch {
+    Write-Warning ("Skipping '{0}' because the timestamp in the file name is invalid." -f $File.Name)
     return $null
   }
 
   [pscustomobject]@{
-    File    = $File
-    IP      = $m.Groups['ip'].Value
-    User    = $m.Groups['user'].Value
-    LogTime = $dt
+    File = $File
+    IP = $match.Groups['ip'].Value
+    User = $match.Groups['user'].Value
+    LogTime = $timestamp
   }
 }
 
 function Get-LogFiles {
-  param([string]$Dir)
-  $files = Get-ChildItem -Path $Dir -File -Filter *.log -ErrorAction Stop
-  if (-not $files) { throw "ログファイル（*.log）が見つかりません: $Dir" }
-  # 出力フォルダ配下を除外
-  $files = $files | Where-Object { $_.DirectoryName -ne $OutputDirectory }
-  return $files
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Directory,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ExcludedDirectory,
+
+    [Parameter()]
+    [switch]$Recursive
+  )
+
+  if (-not (Test-Path -LiteralPath $Directory)) {
+    throw "Log directory was not found: $Directory"
+  }
+
+  $params = @{
+    LiteralPath = $Directory
+    File = $true
+    Filter = '*.log'
+    ErrorAction = 'Stop'
+  }
+
+  if ($Recursive) {
+    $params['Recurse'] = $true
+  }
+
+  $files = Get-ChildItem @params | Where-Object {
+    $_.DirectoryName -ne $ExcludedDirectory
+  }
+
+  if (-not $files) {
+    throw "No log files (*.log) were found in '$Directory'."
+  }
+
+  return ,$files
 }
 
 function Build-Index {
-  param([System.IO.FileInfo[]]$Files)
-  $list = foreach ($f in $Files) {
-    $p = Parse-LogName -File $f
-    if ($p) { $p }
+  param(
+    [Parameter(Mandatory = $true)]
+    [System.IO.FileInfo[]]$Files
+  )
+
+  $parsed = New-Object System.Collections.Generic.List[object]
+  $skipped = New-Object System.Collections.Generic.List[string]
+
+  foreach ($file in $Files) {
+    $entry = Parse-LogName -File $file
+    if ($null -eq $entry) {
+      $skipped.Add($file.Name)
+      continue
+    }
+
+    $parsed.Add($entry)
   }
-  if (-not $list) { throw "命名規則に合致するログが見つかりません（YYMMDD_HHMMSS_IP_from_USER.log）。" }
-  return ,$list
+
+  if ($skipped.Count -gt 0) {
+    Write-Warning ("Skipped {0} file(s) that did not match the naming convention." -f $skipped.Count)
+    foreach ($name in $skipped) {
+      Write-Verbose ("Skipped: {0}" -f $name)
+    }
+  }
+
+  if ($parsed.Count -eq 0) {
+    throw 'No files matched the required naming pattern: YYMMDD_HHMMSS_IP_from_USER.log'
+  }
+
+  return $parsed.ToArray()
 }
 
 function Select-CurrentLog {
   param(
+    [Parameter(Mandatory = $true)]
     [object[]]$Index,
+
+    [Parameter()]
     [string]$ExplicitFile,
+
+    [Parameter()]
     [string]$IP
   )
-  if ($ExplicitFile) {
+
+  if ($PSBoundParameters.ContainsKey('ExplicitFile') -and -not [string]::IsNullOrWhiteSpace($ExplicitFile)) {
     if (-not (Test-Path -LiteralPath $ExplicitFile)) {
-      throw "CurrentFile が見つかりません: $ExplicitFile"
+      throw "CurrentFile was not found: $ExplicitFile"
     }
-    $f = Get-Item -LiteralPath $ExplicitFile
-    $p = Parse-LogName -File $f
-    if (-not $p) { throw "CurrentFile が命名規則に一致しません: $($f.Name)" }
-    return $p
-  } else {
-    $candidates = $Index
-    if ($IP) { $candidates = $candidates | Where-Object { $_.IP -eq $IP } }
-    if (-not $candidates) {
-      if ($IP) { throw "指定IPのログが見つかりません: $IP" }
-      throw "比較対象のログが見つかりません。"
+
+    $file = Get-Item -LiteralPath $ExplicitFile -ErrorAction Stop
+    $parsed = Parse-LogName -File $file
+    if ($null -eq $parsed) {
+      throw "CurrentFile does not match the required naming pattern: $($file.Name)"
     }
-    return $candidates | Sort-Object LogTime -Descending | Select-Object -First 1
+
+    return $parsed
   }
+
+  $candidates = $Index
+  if (-not [string]::IsNullOrWhiteSpace($IP)) {
+    $candidates = $candidates | Where-Object { $_.IP -eq $IP }
+  }
+
+  if (-not $candidates) {
+    if (-not [string]::IsNullOrWhiteSpace($IP)) {
+      throw "No logs were found for IP '$IP'."
+    }
+
+    throw 'No candidate logs were found.'
+  }
+
+  return $candidates | Sort-Object LogTime -Descending | Select-Object -First 1
 }
 
 function Get-ClosestByTime {
   param(
+    [Parameter(Mandatory = $true)]
     [object[]]$Candidates,
+
+    [Parameter(Mandatory = $true)]
     [datetime]$TargetTime,
+
+    [Parameter(Mandatory = $true)]
     [timespan]$Tolerance,
+
+    [Parameter(Mandatory = $true)]
     [object]$Exclude
   )
-  $cands = $Candidates | Where-Object { $_.File.FullName -ne $Exclude.File.FullName }
-  if (-not $cands) { return $null }
 
-  $sel = $cands |
-    Sort-Object @{Expression = { [math]::Abs(($_.LogTime - $TargetTime).TotalSeconds) } ; Ascending = $true } |
+  $filtered = $Candidates | Where-Object { $_.File.FullName -ne $Exclude.File.FullName }
+  if (-not $filtered) {
+    return $null
+  }
+
+  $selected = $filtered |
+    Sort-Object @{ Expression = { [math]::Abs(($_.LogTime - $TargetTime).TotalSeconds) }; Ascending = $true } |
     Select-Object -First 1
 
-  if ($sel -and [math]::Abs(($sel.LogTime - $TargetTime).TotalHours) -le $Tolerance.TotalHours) {
-    return $sel
+  if ($null -eq $selected) {
+    return $null
   }
+
+  $distance = [timespan]::FromSeconds([math]::Abs(($selected.LogTime - $TargetTime).TotalSeconds))
+  if ($distance -le $Tolerance) {
+    return $selected
+  }
+
+  Write-Verbose (
+    "Closest candidate '{0}' was outside tolerance. Target={1}, Candidate={2}, DistanceHours={3:N2}, AllowedHours={4:N2}" -f
+    $selected.File.Name,
+    $TargetTime.ToString('yyyy-MM-dd HH:mm:ss'),
+    $selected.LogTime.ToString('yyyy-MM-dd HH:mm:ss'),
+    $distance.TotalHours,
+    $Tolerance.TotalHours
+  )
+
   return $null
 }
 
-# 今後のノイズ除外（現状は素通し）
-function Filter-NoiseLines {
-  param([string[]]$Lines)
-  # 例: return $Lines | Where-Object { $_ -notmatch 'uptime|Time since last|^\s*$' }
-  return $Lines
-}
-
-function Format-Line {
-  param([string]$Text)
-  if ($null -eq $Text) { return '(no line)' }
-  return $Text
-}
-
-function Compare-FilesWithLineNumbers {
+function Get-IndexedLines {
   param(
-    [string]$CurrentPath,
-    [string]$PastPath,
-    [string]$LabelPast,
-    [datetime]$CurrentLogTime,
-    [datetime]$PastLogTime,
-    [string]$OutputPath
+    [Parameter(Mandatory = $true)]
+    [string]$Path,
+
+    [Parameter()]
+    [string[]]$Patterns = @()
   )
 
-  $currentLines = Get-Content -LiteralPath $CurrentPath -ErrorAction Stop
-  $pastLines    = Get-Content -LiteralPath $PastPath   -ErrorAction Stop
+  $rawLines = Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop
+  $indexed = New-Object System.Collections.Generic.List[object]
 
-  $currentLines = Filter-NoiseLines -Lines $currentLines
-  $pastLines    = Filter-NoiseLines -Lines $pastLines
+  for ($i = 0; $i -lt $rawLines.Count; $i++) {
+    $lineText = [string]$rawLines[$i]
+    $ignore = $false
 
-  $max = [math]::Max($currentLines.Count, $pastLines.Count)
+    foreach ($pattern in $Patterns) {
+      if ($lineText -match $pattern) {
+        $ignore = $true
+        break
+      }
+    }
 
-  $header = @()
-  $header += "=== Diff Report (same IP) ==="
-  $header += "Generated : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-  $header += "Current   : $CurrentPath"
-  $header += "LogTime   : $($CurrentLogTime.ToString('yyyy-MM-dd HH:mm:ss'))"
-  $header += "${LabelPast}: $PastPath"
-  $header += "${LabelPast} LogTime : $($PastLogTime.ToString('yyyy-MM-dd HH:mm:ss'))"
-  $header += "----------------------------------------"
-  $headerText = ($header -join [Environment]::NewLine) + [Environment]::NewLine
+    if ($ignore) {
+      continue
+    }
 
-  $diffCount = 0
-  $sb = New-Object System.Text.StringBuilder
-  [void]$sb.Append($headerText)
+    $indexed.Add([pscustomobject]@{
+      Number = $i + 1
+      Text = $lineText
+    })
+  }
 
-  for ($i = 0; $i -lt $max; $i++) {
-    $cur = if ($i -lt $currentLines.Count) { $currentLines[$i] } else { $null }
-    $pst = if ($i -lt $pastLines.Count)    { $pastLines[$i]    } else { $null }
+  return $indexed.ToArray()
+}
 
-    if ($cur -ne $pst) {
-      $diffCount++
-      $lineNum = $i + 1
-      [void]$sb.AppendLine(("Line {0}" -f $lineNum))
-      [void]$sb.AppendLine(("  Current : {0}" -f (Format-Line $cur)))
-      [void]$sb.AppendLine(("  Past    : {0}" -f (Format-Line $pst)))
-      [void]$sb.AppendLine("  -----------------------------")
+function Format-LineNumber {
+  param(
+    [AllowNull()]
+    [object]$Number
+  )
+
+  if ($null -eq $Number) {
+    return '-'
+  }
+
+  return [string]$Number
+}
+
+function Format-LineText {
+  param(
+    [AllowNull()]
+    [object]$Text
+  )
+
+  if ($null -eq $Text) {
+    return '(no line)'
+  }
+
+  if ([string]$Text -eq '') {
+    return '(empty line)'
+  }
+
+  return [string]$Text
+}
+
+function Get-LcsDiff {
+  param(
+    [Parameter(Mandatory = $true)]
+    [object[]]$CurrentLines,
+
+    [Parameter(Mandatory = $true)]
+    [object[]]$PastLines
+  )
+
+  $rows = $CurrentLines.Count
+  $cols = $PastLines.Count
+  $matrix = New-Object 'int[,]' ($rows + 1), ($cols + 1)
+
+  for ($i = $rows - 1; $i -ge 0; $i--) {
+    for ($j = $cols - 1; $j -ge 0; $j--) {
+      if ($CurrentLines[$i].Text -ceq $PastLines[$j].Text) {
+        $matrix[$i, $j] = $matrix[($i + 1), ($j + 1)] + 1
+      } else {
+        $matrix[$i, $j] = [math]::Max($matrix[($i + 1), $j], $matrix[$i, ($j + 1)])
+      }
     }
   }
 
-  if ($diffCount -eq 0) {
-    [void]$sb.AppendLine("No differences.")
-  } else {
-    [void]$sb.AppendLine(("Diff lines: {0}" -f $diffCount))
+  $diffs = New-Object System.Collections.Generic.List[object]
+  $currentIndex = 0
+  $pastIndex = 0
+
+  while ($currentIndex -lt $rows -or $pastIndex -lt $cols) {
+    if ($currentIndex -lt $rows -and $pastIndex -lt $cols -and $CurrentLines[$currentIndex].Text -ceq $PastLines[$pastIndex].Text) {
+      $currentIndex++
+      $pastIndex++
+      continue
+    }
+
+    if ($currentIndex -lt $rows -and ($pastIndex -ge $cols -or $matrix[($currentIndex + 1), $pastIndex] -ge $matrix[$currentIndex, ($pastIndex + 1)])) {
+      $diffs.Add([pscustomobject]@{
+        Type = 'Added'
+        CurrentNumber = $CurrentLines[$currentIndex].Number
+        CurrentText = $CurrentLines[$currentIndex].Text
+        PastNumber = $null
+        PastText = $null
+      })
+      $currentIndex++
+      continue
+    }
+
+    if ($pastIndex -lt $cols) {
+      $diffs.Add([pscustomobject]@{
+        Type = 'Removed'
+        CurrentNumber = $null
+        CurrentText = $null
+        PastNumber = $PastLines[$pastIndex].Number
+        PastText = $PastLines[$pastIndex].Text
+      })
+      $pastIndex++
+    }
   }
 
-  $sb.ToString() | Out-File -LiteralPath $OutputPath -Encoding UTF8 -Force
-  return $diffCount
+  return $diffs.ToArray()
 }
 
-# ====== Main ======
+function Write-DiffReport {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$CurrentPath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$PastPath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$LabelPast,
+
+    [Parameter(Mandatory = $true)]
+    [datetime]$CurrentLogTime,
+
+    [Parameter(Mandatory = $true)]
+    [datetime]$PastLogTime,
+
+    [Parameter(Mandatory = $true)]
+    [string]$OutputPath,
+
+    [Parameter()]
+    [string[]]$Patterns = @()
+  )
+
+  $currentLines = Get-IndexedLines -Path $CurrentPath -Patterns $Patterns
+  $pastLines = Get-IndexedLines -Path $PastPath -Patterns $Patterns
+  $diffs = Get-LcsDiff -CurrentLines $currentLines -PastLines $pastLines
+
+  $header = @(
+    '=== Diff Report (same IP) ==='
+    ("Generated           : {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    ("Current file        : {0}" -f $CurrentPath)
+    ("Current log time    : {0}" -f $CurrentLogTime.ToString('yyyy-MM-dd HH:mm:ss'))
+    ("Comparison label    : {0}" -f $LabelPast)
+    ("Past file           : {0}" -f $PastPath)
+    ("Past log time       : {0}" -f $PastLogTime.ToString('yyyy-MM-dd HH:mm:ss'))
+    ("Ignore patterns     : {0}" -f $(if ($Patterns.Count -gt 0) { $Patterns -join '; ' } else { '(none)' }))
+    '----------------------------------------'
+  )
+
+  $report = New-Object System.Text.StringBuilder
+  [void]$report.AppendLine(($header -join [Environment]::NewLine))
+
+  if ($diffs.Count -eq 0) {
+    [void]$report.AppendLine('No differences.')
+  } else {
+    foreach ($diff in $diffs) {
+      [void]$report.AppendLine(("Change type         : {0}" -f $diff.Type))
+      [void]$report.AppendLine(("Current line number : {0}" -f (Format-LineNumber -Number $diff.CurrentNumber)))
+      [void]$report.AppendLine(("Current line text   : {0}" -f (Format-LineText -Text $diff.CurrentText)))
+      [void]$report.AppendLine(("Past line number    : {0}" -f (Format-LineNumber -Number $diff.PastNumber)))
+      [void]$report.AppendLine(("Past line text      : {0}" -f (Format-LineText -Text $diff.PastText)))
+      [void]$report.AppendLine('----------------------------------------')
+    }
+
+    [void]$report.AppendLine(("Total changes       : {0}" -f $diffs.Count))
+  }
+
+  $report.ToString() | Out-File -LiteralPath $OutputPath -Encoding UTF8 -Force
+
+  [pscustomobject]@{
+    OutputPath = $OutputPath
+    ChangeCount = $diffs.Count
+  }
+}
+
 Resolve-DefaultPaths
-Ensure-OutputDir
+Ensure-Directory -Path $OutputDirectory
 
-$files = Get-LogFiles -Dir $LogDirectory
-$index = Build-Index -Files $files
+$logFiles = Get-LogFiles -Directory $LogDirectory -ExcludedDirectory $OutputDirectory -Recursive:$Recurse
+$index = Build-Index -Files $logFiles
 
-# 現在ログ（CurrentFile 優先、次いで TargetIP で絞り、最後は全体から最新を選択）
 $current = Select-CurrentLog -Index $index -ExplicitFile $CurrentFile -IP $TargetIP
+$ipCandidates = $index | Where-Object { $_.IP -eq $current.IP }
 
-# 同一IPの候補に絞る
-$ip = $current.IP
-$ipCandidates = $index | Where-Object { $_.IP -eq $ip }
+$oneDayTarget = $current.LogTime.AddDays(-1)
+$oneWeekTarget = $current.LogTime.AddDays(-7)
 
-# 基準は「現在ログの採取時刻（ファイル名から解析した時刻）」
-$baseTime = $current.LogTime
-$oneDayTarget  = $baseTime.AddDays(-1)
-$oneWeekTarget = $baseTime.AddDays(-7)
-
-$oneDayFile  = Get-ClosestByTime -Candidates $ipCandidates -TargetTime $oneDayTarget  -Tolerance ([TimeSpan]::FromHours($OneDayToleranceHours))  -Exclude $current
+$oneDayFile = Get-ClosestByTime -Candidates $ipCandidates -TargetTime $oneDayTarget -Tolerance ([TimeSpan]::FromHours($OneDayToleranceHours)) -Exclude $current
 $oneWeekFile = Get-ClosestByTime -Candidates $ipCandidates -TargetTime $oneWeekTarget -Tolerance ([TimeSpan]::FromHours($OneWeekToleranceHours)) -Exclude $current
 
-if (-not $oneDayFile)  { Write-Warning "1日前（±$OneDayToleranceHours h）に近い同一IP($ip)ログが見つかりません。" }
-if (-not $oneWeekFile) { Write-Warning "1週間前（±$OneWeekToleranceHours h）に近い同一IP($ip)ログが見つかりません。" }
-
-# 出力ファイル名（現在ログベース）
-$base = [IO.Path]::GetFileNameWithoutExtension($current.File.Name)
-$stamp = (Get-Date -Format 'yyyyMMdd-HHmmss')
-
-if ($oneDayFile) {
-  $out1 = Join-Path $OutputDirectory ("diff_1day_{0}_{1}.txt" -f $base, $stamp)
-  $c1 = Compare-FilesWithLineNumbers `
-          -CurrentPath $current.File.FullName `
-          -PastPath    $oneDayFile.File.FullName `
-          -LabelPast   '1day-ago' `
-          -CurrentLogTime $current.LogTime `
-          -PastLogTime    $oneDayFile.LogTime `
-          -OutputPath  $out1
-  Write-Host ("[IP {0}] 1day diff: {1} lines -> {2}" -f $ip, $c1, $out1)
+if ($null -eq $oneDayFile) {
+  Write-Warning ("No same-IP log was found near 1 day earlier for IP '{0}' within +/-{1} hours." -f $current.IP, $OneDayToleranceHours)
 }
 
-if ($oneWeekFile) {
-  $out7 = Join-Path $OutputDirectory ("diff_1week_{0}_{1}.txt" -f $base, $stamp)
-  $c7 = Compare-FilesWithLineNumbers `
-          -CurrentPath $current.File.FullName `
-          -PastPath    $oneWeekFile.File.FullName `
-          -LabelPast   '1week-ago' `
-          -CurrentLogTime $current.LogTime `
-          -PastLogTime    $oneWeekFile.LogTime `
-          -OutputPath  $out7
-  Write-Host ("[IP {0}] 1week diff: {1} lines -> {2}" -f $ip, $c7, $out7)
+if ($null -eq $oneWeekFile) {
+  Write-Warning ("No same-IP log was found near 1 week earlier for IP '{0}' within +/-{1} hours." -f $current.IP, $OneWeekToleranceHours)
 }
+
+$baseName = [System.IO.Path]::GetFileNameWithoutExtension($current.File.Name)
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$results = New-Object System.Collections.Generic.List[object]
+
+if ($null -ne $oneDayFile) {
+  $oneDayOutput = Join-Path $OutputDirectory ("diff_1day_{0}_{1}.txt" -f $baseName, $stamp)
+  $result = Write-DiffReport `
+    -CurrentPath $current.File.FullName `
+    -PastPath $oneDayFile.File.FullName `
+    -LabelPast '1day-ago' `
+    -CurrentLogTime $current.LogTime `
+    -PastLogTime $oneDayFile.LogTime `
+    -OutputPath $oneDayOutput `
+    -Patterns $IgnorePattern
+  $results.Add($result)
+}
+
+if ($null -ne $oneWeekFile) {
+  $oneWeekOutput = Join-Path $OutputDirectory ("diff_1week_{0}_{1}.txt" -f $baseName, $stamp)
+  $result = Write-DiffReport `
+    -CurrentPath $current.File.FullName `
+    -PastPath $oneWeekFile.File.FullName `
+    -LabelPast '1week-ago' `
+    -CurrentLogTime $current.LogTime `
+    -PastLogTime $oneWeekFile.LogTime `
+    -OutputPath $oneWeekOutput `
+    -Patterns $IgnorePattern
+  $results.Add($result)
+}
+
+if ($results.Count -eq 0) {
+  Write-Warning 'No reports were generated.'
+  return
+}
+
+$results

@@ -1,0 +1,54 @@
+name: PowerShell CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse script
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path './Compare-ShowLogs_ByIP.ps1'), [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { $_.ToString() }
+            exit 1
+          }
+
+      - name: Run sample comparison
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path './tmp/logs' | Out-Null
+          Set-Content -LiteralPath './tmp/logs/260314_090000_10.0.0.1_from_admin.log' -Value @(
+            'show version',
+            'hostname R1',
+            'interface Gi0/0',
+            ' ip address 10.0.0.1'
+          ) -Encoding UTF8
+          Set-Content -LiteralPath './tmp/logs/260313_090000_10.0.0.1_from_admin.log' -Value @(
+            'show version',
+            'hostname R1-old',
+            'interface Gi0/0',
+            ' ip address 10.0.0.1'
+          ) -Encoding UTF8
+          Set-Content -LiteralPath './tmp/logs/260307_090000_10.0.0.1_from_admin.log' -Value @(
+            'show version',
+            'hostname R1-old',
+            'banner motd test',
+            'interface Gi0/0',
+            ' ip address 10.0.0.1'
+          ) -Encoding UTF8
+          $results = ./Compare-ShowLogs_ByIP.ps1 -LogDirectory (Resolve-Path './tmp/logs') -OutputDirectory './tmp/out'
+          if (-not $results) {
+            throw 'Expected the script to produce at least one result.'
+          }

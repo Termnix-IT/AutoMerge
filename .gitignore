@@ -1,0 +1,23 @@
+# PowerShell
+*.psd1
+*.psm1~
+
+# Logs and generated reports
+*.log
+*.txt
+!README.md
+!LICENSE
+!AutoMerge.txt
+
+# Local test artifacts
+tmp/
+.tmp-logs/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+.vscode/
+.idea/
