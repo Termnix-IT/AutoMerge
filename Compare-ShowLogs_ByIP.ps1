@@ -357,11 +357,11 @@ function Format-LineText {
   )
 
   if ($null -eq $Text) {
-    return '(no line)'
+    return '（該当行なし）'
   }
 
   if ([string]$Text -eq '') {
-    return '(empty line)'
+    return '（空行）'
   }
 
   return [string]$Text
@@ -562,7 +562,7 @@ if ($null -ne $oneDayFile) {
   $result = Write-DiffReport `
     -CurrentPath $current.File.FullName `
     -PastPath $oneDayFile.File.FullName `
-    -LabelPast '1day-ago' `
+    -LabelPast '1日前比較' `
     -CurrentLogTime $current.LogTime `
     -PastLogTime $oneDayFile.LogTime `
     -OutputPath $oneDayOutput `
@@ -575,7 +575,7 @@ if ($null -ne $oneWeekFile) {
   $result = Write-DiffReport `
     -CurrentPath $current.File.FullName `
     -PastPath $oneWeekFile.File.FullName `
-    -LabelPast '1week-ago' `
+    -LabelPast '1週間前比較' `
     -CurrentLogTime $current.LogTime `
     -PastLogTime $oneWeekFile.LogTime `
     -OutputPath $oneWeekOutput `

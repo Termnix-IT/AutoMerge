@@ -42,6 +42,8 @@ YYMMDD_HHMMSS_IP_from_USER.log
 
 ## 使い方
 
+詳細な手順は [使い方.md](C:\Users\lugep\デスクトップ\Google Drive\ProjectFolder\AutoMerge\使い方.md) を参照してください。
+
 既定値で実行する場合:
 
 ```powershell
@@ -96,6 +98,15 @@ YYMMDD_HHMMSS_IP_from_USER.log
 OutputPath
 ChangeCount
 ```
+
+レポート本文の見出しは日本語で出力されます。主な表記は次の通りです。
+
+- `変更種別`
+- `現在行番号`
+- `現在行テキスト`
+- `比較先行番号`
+- `比較先行テキスト`
+- `変更件数合計`
 
 ## 注意事項
 
