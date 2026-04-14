@@ -310,7 +310,7 @@ function Get-IndexedLines {
     [string[]]$Patterns = @()
   )
 
-  $rawLines = Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop
+  $rawLines = @(Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop)
   $indexed = New-Object System.Collections.Generic.List[object]
 
   for ($i = 0; $i -lt $rawLines.Count; $i++) {
@@ -376,13 +376,49 @@ function Get-LcsDiff {
     [object[]]$PastLines
   )
 
-  $rows = $CurrentLines.Count
-  $cols = $PastLines.Count
+  $currentCount = $CurrentLines.Count
+  $pastCount = $PastLines.Count
+  $prefixLength = 0
+
+  while (
+    $prefixLength -lt $currentCount -and
+    $prefixLength -lt $pastCount -and
+    $CurrentLines[$prefixLength].Text -ceq $PastLines[$prefixLength].Text
+  ) {
+    $prefixLength++
+  }
+
+  $suffixLength = 0
+  while (
+    $suffixLength -lt ($currentCount - $prefixLength) -and
+    $suffixLength -lt ($pastCount - $prefixLength) -and
+    $CurrentLines[$currentCount - 1 - $suffixLength].Text -ceq $PastLines[$pastCount - 1 - $suffixLength].Text
+  ) {
+    $suffixLength++
+  }
+
+  $currentCoreLength = $currentCount - $prefixLength - $suffixLength
+  $pastCoreLength = $pastCount - $prefixLength - $suffixLength
+
+  if ($currentCoreLength -gt 0) {
+    $currentCore = @($CurrentLines[$prefixLength..($prefixLength + $currentCoreLength - 1)])
+  } else {
+    $currentCore = @()
+  }
+
+  if ($pastCoreLength -gt 0) {
+    $pastCore = @($PastLines[$prefixLength..($prefixLength + $pastCoreLength - 1)])
+  } else {
+    $pastCore = @()
+  }
+
+  $rows = $currentCore.Count
+  $cols = $pastCore.Count
   $matrix = New-Object 'int[,]' ($rows + 1), ($cols + 1)
 
   for ($i = $rows - 1; $i -ge 0; $i--) {
     for ($j = $cols - 1; $j -ge 0; $j--) {
-      if ($CurrentLines[$i].Text -ceq $PastLines[$j].Text) {
+      if ($currentCore[$i].Text -ceq $pastCore[$j].Text) {
         $matrix[$i, $j] = $matrix[($i + 1), ($j + 1)] + 1
       } else {
         $matrix[$i, $j] = [math]::Max($matrix[($i + 1), $j], $matrix[$i, ($j + 1)])
@@ -395,7 +431,7 @@ function Get-LcsDiff {
   $pastIndex = 0
 
   while ($currentIndex -lt $rows -or $pastIndex -lt $cols) {
-    if ($currentIndex -lt $rows -and $pastIndex -lt $cols -and $CurrentLines[$currentIndex].Text -ceq $PastLines[$pastIndex].Text) {
+    if ($currentIndex -lt $rows -and $pastIndex -lt $cols -and $currentCore[$currentIndex].Text -ceq $pastCore[$pastIndex].Text) {
       $currentIndex++
       $pastIndex++
       continue
@@ -403,9 +439,9 @@ function Get-LcsDiff {
 
     if ($currentIndex -lt $rows -and ($pastIndex -ge $cols -or $matrix[($currentIndex + 1), $pastIndex] -ge $matrix[$currentIndex, ($pastIndex + 1)])) {
       $diffs.Add([pscustomobject]@{
-        Type = 'Added'
-        CurrentNumber = $CurrentLines[$currentIndex].Number
-        CurrentText = $CurrentLines[$currentIndex].Text
+        Type = '追加'
+        CurrentNumber = $currentCore[$currentIndex].Number
+        CurrentText = $currentCore[$currentIndex].Text
         PastNumber = $null
         PastText = $null
       })
@@ -415,11 +451,11 @@ function Get-LcsDiff {
 
     if ($pastIndex -lt $cols) {
       $diffs.Add([pscustomobject]@{
-        Type = 'Removed'
+        Type = '削除'
         CurrentNumber = $null
         CurrentText = $null
-        PastNumber = $PastLines[$pastIndex].Number
-        PastText = $PastLines[$pastIndex].Text
+        PastNumber = $pastCore[$pastIndex].Number
+        PastText = $pastCore[$pastIndex].Text
       })
       $pastIndex++
     }
@@ -457,14 +493,14 @@ function Write-DiffReport {
   $diffs = Get-LcsDiff -CurrentLines $currentLines -PastLines $pastLines
 
   $header = @(
-    '=== Diff Report (same IP) ==='
-    ("Generated           : {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
-    ("Current file        : {0}" -f $CurrentPath)
-    ("Current log time    : {0}" -f $CurrentLogTime.ToString('yyyy-MM-dd HH:mm:ss'))
-    ("Comparison label    : {0}" -f $LabelPast)
-    ("Past file           : {0}" -f $PastPath)
-    ("Past log time       : {0}" -f $PastLogTime.ToString('yyyy-MM-dd HH:mm:ss'))
-    ("Ignore patterns     : {0}" -f $(if ($Patterns.Count -gt 0) { $Patterns -join '; ' } else { '(none)' }))
+    '=== 差分レポート（同一IP） ==='
+    ("生成日時           : {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    ("現在ファイル       : {0}" -f $CurrentPath)
+    ("現在ログ日時       : {0}" -f $CurrentLogTime.ToString('yyyy-MM-dd HH:mm:ss'))
+    ("比較ラベル         : {0}" -f $LabelPast)
+    ("比較先ファイル     : {0}" -f $PastPath)
+    ("比較先ログ日時     : {0}" -f $PastLogTime.ToString('yyyy-MM-dd HH:mm:ss'))
+    ("除外パターン       : {0}" -f $(if ($Patterns.Count -gt 0) { $Patterns -join '; ' } else { 'なし' }))
     '----------------------------------------'
   )
 
@@ -472,18 +508,18 @@ function Write-DiffReport {
   [void]$report.AppendLine(($header -join [Environment]::NewLine))
 
   if ($diffs.Count -eq 0) {
-    [void]$report.AppendLine('No differences.')
+    [void]$report.AppendLine('差分はありません。')
   } else {
     foreach ($diff in $diffs) {
-      [void]$report.AppendLine(("Change type         : {0}" -f $diff.Type))
-      [void]$report.AppendLine(("Current line number : {0}" -f (Format-LineNumber -Number $diff.CurrentNumber)))
-      [void]$report.AppendLine(("Current line text   : {0}" -f (Format-LineText -Text $diff.CurrentText)))
-      [void]$report.AppendLine(("Past line number    : {0}" -f (Format-LineNumber -Number $diff.PastNumber)))
-      [void]$report.AppendLine(("Past line text      : {0}" -f (Format-LineText -Text $diff.PastText)))
+      [void]$report.AppendLine(("変更種別           : {0}" -f $diff.Type))
+      [void]$report.AppendLine(("現在行番号         : {0}" -f (Format-LineNumber -Number $diff.CurrentNumber)))
+      [void]$report.AppendLine(("現在行テキスト     : {0}" -f (Format-LineText -Text $diff.CurrentText)))
+      [void]$report.AppendLine(("比較先行番号       : {0}" -f (Format-LineNumber -Number $diff.PastNumber)))
+      [void]$report.AppendLine(("比較先行テキスト   : {0}" -f (Format-LineText -Text $diff.PastText)))
       [void]$report.AppendLine('----------------------------------------')
     }
 
-    [void]$report.AppendLine(("Total changes       : {0}" -f $diffs.Count))
+    [void]$report.AppendLine(("変更件数合計       : {0}" -f $diffs.Count))
   }
 
   $report.ToString() | Out-File -LiteralPath $OutputPath -Encoding UTF8 -Force

@@ -52,3 +52,14 @@ jobs:
           if (-not $results) {
             throw 'Expected the script to produce at least one result.'
           }
+
+      - name: Run single-line regression test
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path './tmp/single-line/logs' | Out-Null
+          Set-Content -LiteralPath './tmp/single-line/logs/260314_090000_10.0.0.2_from_admin.log' -Value 'hostname R2' -Encoding UTF8
+          Set-Content -LiteralPath './tmp/single-line/logs/260313_090000_10.0.0.2_from_admin.log' -Value 'hostname R2-old' -Encoding UTF8
+          $results = ./Compare-ShowLogs_ByIP.ps1 -LogDirectory (Resolve-Path './tmp/single-line/logs') -OutputDirectory './tmp/single-line/out' -TargetIP '10.0.0.2'
+          if (-not $results) {
+            throw 'Expected the single-line regression test to produce a result.'
+          }
